@@ -1,0 +1,132 @@
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.linear_model import Lasso
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+from sklearn.model_selection import train_test_split
+import optuna
+
+def objective_rf(trial, train_inputs, train_outputs, test_inputs, test_outputs, outputs_scaler):
+    # Define hyperparameters to be optimized
+    n_estimators = trial.suggest_int('n_estimators', 10, 100)
+    max_depth = trial.suggest_int('max_depth', 2, 32, log=True)
+    
+    # Initialize and fit RandomForestRegressor with hyperparameters
+    model_rf = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42)
+    model_rf.fit(train_inputs, train_outputs)
+
+    # Predict on the test data
+    predictions_rf = model_rf.predict(test_inputs)
+
+    # Inverse transform the predictions and the actual values to get back to the original scale
+    predictions_rf_inv = outputs_scaler.inverse_transform(predictions_rf.reshape(-1, 1)).flatten()
+    test_outputs_inv = outputs_scaler.inverse_transform(test_outputs.reshape(-1, 1)).flatten()
+
+    # Calculate the R2 score for optimization
+    r2 = r2_score(test_outputs_inv, predictions_rf_inv)
+
+    return r2
+
+def objective_svr(trial, train_inputs, train_outputs, test_inputs, test_outputs, outputs_scaler):
+    # Define hyperparameters to be optimized
+    C = trial.suggest_loguniform('C', 1e-5, 1e5)
+    epsilon = trial.suggest_loguniform('epsilon', 1e-5, 1e-1)
+    
+    # Initialize and fit SVR with hyperparameters
+    model_svr = SVR(C=C, epsilon=epsilon)
+    model_svr.fit(train_inputs, train_outputs)
+
+    # Predict on the test data
+    predictions_svr = model_svr.predict(test_inputs)
+
+    # Inverse transform the predictions and the actual values to get back to the original scale
+    predictions_svr_inv = outputs_scaler.inverse_transform(predictions_svr.reshape(-1, 1)).flatten()
+    test_outputs_inv = outputs_scaler.inverse_transform(test_outputs.reshape(-1, 1)).flatten()
+
+    # Calculate the R2 score for optimization
+    r2 = r2_score(test_outputs_inv, predictions_svr_inv)
+
+    return r2
+
+def objective_lasso(trial, train_inputs, train_outputs, test_inputs, test_outputs, outputs_scaler):
+    # Define hyperparameters to be optimized
+    alpha = trial.suggest_loguniform('alpha', 1e-5, 1e2)
+    
+    # Initialize and fit Lasso with hyperparameters
+    model_lasso = Lasso(alpha=alpha)
+    model_lasso.fit(train_inputs, train_outputs)
+
+    # Predict on the test data
+    predictions_lasso = model_lasso.predict(test_inputs)
+
+    # Inverse transform the predictions and the actual values to get back to the original scale
+    predictions_lasso_inv = outputs_scaler.inverse_transform(predictions_lasso.reshape(-1, 1)).flatten()
+    test_outputs_inv = outputs_scaler.inverse_transform(test_outputs.reshape(-1, 1)).flatten()
+
+    # Calculate the R2 score for optimization
+    r2 = r2_score(test_outputs_inv, predictions_lasso_inv)
+
+    return r2
+
+def train_evaluate_models_optuna(training_inputs, training_outputs, test_inputs, test_outputs, outputs_scaler):
+    # Optimize RandomForestRegressor
+    study_rf = optuna.create_study(direction='maximize')
+    study_rf.optimize(lambda trial: objective_rf(trial, training_inputs, training_outputs, test_inputs, test_outputs, outputs_scaler), n_trials=50)
+    best_params_rf = study_rf.best_params
+
+    # Optimize SVR
+    study_svr = optuna.create_study(direction='maximize')
+    study_svr.optimize(lambda trial: objective_svr(trial, training_inputs, training_outputs, test_inputs, test_outputs, outputs_scaler), n_trials=50)
+    best_params_svr = study_svr.best_params
+
+    # Optimize Lasso
+    study_lasso = optuna.create_study(direction='maximize')
+    study_lasso.optimize(lambda trial: objective_lasso(trial, training_inputs, training_outputs, test_inputs, test_outputs, outputs_scaler), n_trials=50)
+    best_params_lasso = study_lasso.best_params
+
+    # Initialize models with the best hyperparameters
+    model_rf_optimized = RandomForestRegressor(**best_params_rf)
+    model_svr_optimized = SVR(**best_params_svr)
+    model_lasso_optimized = Lasso(**best_params_lasso)
+
+    # Fit the models
+    model_rf_optimized.fit(training_inputs, training_outputs)
+    model_svr_optimized.fit(training_inputs, training_outputs)
+    model_lasso_optimized.fit(training_inputs, training_outputs)
+
+    # Predict on the test data with optimized models
+    predictions_rf_optimized = model_rf_optimized.predict(test_inputs)
+    predictions_svr_optimized = model_svr_optimized.predict(test_inputs)
+    predictions_lasso_optimized = model_lasso_optimized.predict(test_inputs)
+
+    # Inverse transform the predictions and the actual values to get back to the original scale
+    predictions_rf_inv_optimized = outputs_scaler.inverse_transform(predictions_rf_optimized.reshape(-1, 1)).flatten()
+    predictions_svr_inv_optimized = outputs_scaler.inverse_transform(predictions_svr_optimized.reshape(-1, 1)).flatten()
+    predictions_lasso_inv_optimized = outputs_scaler.inverse_transform(predictions_lasso_optimized.reshape(-1, 1)).flatten()
+    test_outputs_inv = outputs_scaler.inverse_transform(test_outputs.reshape(-1, 1)).flatten()
+
+    # Compile metrics for each optimized model
+    metrics_optimized = {}
+    for name, predictions_inv_optimized in zip(['Random Forest Optimized', 'SVR Optimized', 'Lasso Optimized'],
+                                              [predictions_rf_inv_optimized, predictions_svr_inv_optimized, predictions_lasso_inv_optimized]):
+        errors_optimized = predictions_inv_optimized - test_outputs_inv
+        relative_errors_optimized = errors_optimized / np.maximum(np.abs(test_outputs_inv), 1e-8)
+
+        metrics_optimized[name] = {
+            'Mean of Error': np.mean(errors_optimized),
+            'Std of Error': np.std(errors_optimized),
+            'Max of Error': np.max(errors_optimized),
+            'MAE': mean_absolute_error(test_outputs_inv, predictions_inv_optimized),
+            'Mean Absolute Percentage Error': mean_absolute_percentage_error(test_outputs_inv, predictions_inv_optimized),
+            'Max Absolute Percentage Error': np.max(np.abs(relative_errors_optimized)),
+            'MSE': mean_squared_error(test_outputs_inv, predictions_inv_optimized),
+            'SSE': np.sum(np.square(errors_optimized)),
+            'R': np.corrcoef(test_outputs_inv, predictions_inv_optimized)[0, 1],
+            'R2 Score': r2_score(test_outputs_inv, predictions_inv_optimized)
+        }
+
+    # Create a pandas DataFrame to display the results for optimized models
+    results_df_optimized = pd.DataFrame(metrics_optimized)
+
+    return results_df_optimized.T
