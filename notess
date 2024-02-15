@@ -1,0 +1,112 @@
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.stats import ks_2samp, norm
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.linear_model import Lasso
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+from sklearn.model_selection import train_test_split
+import optuna
+
+def objective(trial, model, train_inputs, train_outputs, test_inputs, test_outputs, outputs_scaler):
+    # Define hyperparameters to be optimized
+    hyperparams = {}
+    for param_name, param_range in trial.params.items():
+        if 'log' in param_range:
+            hyperparams[param_name] = trial.suggest_loguniform(param_name, param_range[0], param_range[1])
+        else:
+            hyperparams[param_name] = trial.suggest_int(param_name, param_range[0], param_range[1])
+
+    # Initialize and fit the model with hyperparameters
+    optimized_model = model(**hyperparams)
+    optimized_model.fit(train_inputs, train_outputs.ravel())
+
+    # Predict on the test data
+    predictions = optimized_model.predict(test_inputs)
+
+    # Inverse transform predictions and calculate errors
+    if outputs_scaler is None:
+        test_outputs_inv = test_outputs
+    else:    
+        test_outputs_inv = outputs_scaler.inverse_transform(test_outputs.reshape(-1, 1)).flatten()
+
+    if outputs_scaler is None:
+        predictions_inv = predictions
+    else:
+        predictions_inv = outputs_scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
+
+    errors = predictions_inv - test_outputs_inv
+    relative_errors = errors / np.maximum(np.abs(test_outputs_inv), 1e-8)
+
+    # Calculate metrics
+    metrics = {
+        'Mean of Error': np.mean(errors),
+        'Std of Error': np.std(errors),
+        'Max of Error': np.max(errors),
+        'MAE': mean_absolute_error(test_outputs_inv, predictions_inv),
+        'Mean Absolute Percentage Error': mean_absolute_percentage_error(test_outputs_inv, predictions_inv),
+        'Max Absolute Percentage Error': np.max(np.abs(relative_errors)),
+        'MSE': mean_squared_error(test_outputs_inv, predictions_inv),
+        'SSE': np.sum(np.square(errors)),
+        'R': np.corrcoef(test_outputs_inv, predictions_inv)[0, 1],
+        'R2 Score': r2_score(test_outputs_inv, predictions_inv),
+        'KS-test p-value': ks_2samp(errors, np.random.normal(np.mean(errors), np.std(errors), len(errors))).pvalue
+    }
+
+    return metrics
+
+def train_evaluate_models_optuna(training_inputs, training_outputs, test_inputs, test_outputs, outputs_scaler=None):
+    # Models to optimize
+    models_to_optimize = [
+        (RandomForestRegressor, {'n_estimators': (10, 100), 'max_depth': (2, 32, 'log')}),
+        (SVR, {'C': (1e-5, 1e5), 'epsilon': (1e-5, 1e-1)}),
+        (Lasso, {'alpha': (1e-5, 1e2)})
+    ]
+
+    # Split data into training and validation sets
+    X_train, X_val, y_train, y_val = train_test_split(training_inputs, training_outputs, test_size=0.2, random_state=42)
+
+    # Optimize each model
+    results_optimized = {}
+    for model_class, param_ranges in models_to_optimize:
+        study = optuna.create_study(direction='minimize')
+        objective_func = lambda trial: objective(trial, model_class, X_train, y_train, X_val, y_val, outputs_scaler)
+        study.optimize(objective_func, n_trials=50)
+        best_params = study.best_params
+
+        # Initialize model with the best hyperparameters
+        optimized_model = model_class(**best_params)
+
+        # Fit the model on the entire training data
+        optimized_model.fit(training_inputs, training_outputs.ravel())
+
+        # Predict on the test data with the optimized model
+        predictions_optimized = optimized_model.predict(test_inputs)
+
+        # Inverse transform the predictions to get back to the original scale
+        predictions_inv_optimized = outputs_scaler.inverse_transform(predictions_optimized.reshape(-1, 1)).flatten()
+
+        # Compile metrics for the optimized model
+        errors_optimized = predictions_inv_optimized - test_outputs
+        relative_errors_optimized = errors_optimized / np.maximum(np.abs(test_outputs), 1e-8)
+
+        results_optimized[model_class.__name__ + ' Optimized'] = {
+            'Mean of Error': np.mean(errors_optimized),
+            'Std of Error': np.std(errors_optimized),
+            'Max of Error': np.max(errors_optimized),
+            'MAE': mean_absolute_error(test_outputs, predictions_inv_optimized),
+            'Mean Absolute Percentage Error': mean_absolute_percentage_error(test_outputs, predictions_inv_optimized),
+            'Max Absolute Percentage Error': np.max(np.abs(relative_errors_optimized)),
+            'MSE': mean_squared_error(test_outputs, predictions_inv_optimized),
+            'SSE': np.sum(np.square(errors_optimized)),
+            'R': np.corrcoef(test_outputs, predictions_inv_optimized)[0, 1],
+            'R2 Score': r2_score(test_outputs, predictions_inv_optimized),
+            'KS-test p-value': ks_2samp(errors_optimized, np.random.normal(np.mean(errors_optimized), np.std(errors_optimized), len(errors_optimized))).pvalue
+        }
+
+    # Return results as a DataFrame
+    results_df_optimized = pd.DataFrame(results_optimized).T
+
+    return results_df_optimized
